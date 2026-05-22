@@ -16,13 +16,91 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 STD_INPUT_HANDLE = -10
+STD_OUTPUT_HANDLE_FOR_VT = -11  # kept distinct from STD_OUTPUT_HANDLE below to avoid forward-ref
 KEY_EVENT = 0x0001
 VK_RETURN = 0x0D
+
+# Console-mode bits for SetConsoleMode (Windows Console API)
+ENABLE_PROCESSED_OUTPUT = 0x0001
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
 
 # Window message constants used by the wm_setfocus Enter backend.
 WM_SETFOCUS = 0x0007
 WM_ACTIVATE = 0x0006
 WA_ACTIVE = 1
+
+
+def enable_vt_mode(verbose: bool = True):
+    """Enable virtual terminal processing on the underlying console.
+
+    Newer TUI agents (codex, claude, etc.) emit ANSI escape sequences directly
+    rather than calling SetConsoleMode themselves. Without VT processing enabled,
+    sequences like `?2026h` (synchronized output) leak as literal text and the
+    UI is unreadable.
+
+    We open CONOUT$/CONIN$ directly via CreateFileW rather than going through the
+    inherited STDOUT handle — this way, even if Python's stdio has been
+    redirected through pipes (or a Node/Rust child later reopens its own handle
+    to the console), the underlying conhost device gets the mode flipped.
+
+    Safe to call multiple times. Failures are logged but not fatal.
+    """
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    # Set explicit signatures so HANDLE doesn't get truncated to 32 bits on x64.
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetConsoleMode.restype = wintypes.BOOL
+    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetConsoleMode.restype = wintypes.BOOL
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+
+    targets = (
+        ("CONOUT$", GENERIC_READ | GENERIC_WRITE,
+         ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT, "stdout"),
+        ("CONIN$",  GENERIC_READ | GENERIC_WRITE,
+         ENABLE_VIRTUAL_TERMINAL_INPUT, "stdin"),
+    )
+
+    for device, access, extra_bits, label in targets:
+        handle = kernel32.CreateFileW(
+            device, access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None, OPEN_EXISTING, 0, None,
+        )
+        if not handle or handle == INVALID_HANDLE_VALUE:
+            if verbose:
+                print(f"  [wrapper] VT enable ({label}): could not open {device}", flush=True)
+            continue
+        try:
+            mode = wintypes.DWORD(0)
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                if verbose:
+                    print(f"  [wrapper] VT enable ({label}): GetConsoleMode failed", flush=True)
+                continue
+            before = mode.value
+            new_mode = before | extra_bits
+            if new_mode == before:
+                if verbose:
+                    print(f"  [wrapper] VT enable ({label}): already 0x{before:04x} (VT bits set)", flush=True)
+                continue
+            ok = kernel32.SetConsoleMode(handle, new_mode)
+            if verbose:
+                status = "ok" if ok else "FAILED"
+                print(f"  [wrapper] VT enable ({label}): 0x{before:04x} -> 0x{new_mode:04x} [{status}]", flush=True)
+        finally:
+            kernel32.CloseHandle(handle)
 
 
 class _CHAR_UNION(ctypes.Union):
@@ -257,8 +335,81 @@ def get_activity_checker(pid_holder, agent_name="unknown", trigger_flag=None):
     return check
 
 
+def _vt_keepalive_thread():
+    """Re-assert VT mode every 10ms in case the child clears it.
+
+    Newer codex builds appear to call SetConsoleMode themselves around their
+    frame draws, sometimes stripping ENABLE_VIRTUAL_TERMINAL_PROCESSING in the
+    process. A one-shot enable at launch wins the first frame then loses; a
+    slow keepalive wins most frames but leaks during redraws. We need to win
+    the race, so we hammer SetConsoleMode at 10ms intervals.
+
+    Single long-lived CONOUT$ handle (opened once) means each iteration is just
+    one SetConsoleMode syscall — ~100 per second, trivial cost.
+    """
+    import threading as _threading
+    import time as _time
+
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetConsoleMode.restype = wintypes.BOOL
+    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetConsoleMode.restype = wintypes.BOOL
+
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    REQUIRED_BITS = ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT
+
+    out_handle = kernel32.CreateFileW(
+        "CONOUT$", GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None, OPEN_EXISTING, 0, None,
+    )
+    if not out_handle or out_handle == INVALID_HANDLE_VALUE:
+        return  # no console — nothing to keep alive
+
+    def _loop():
+        mode = wintypes.DWORD(0)
+        # Tight initial burst (1ms × ~500 iters ≈ 0.5s) to win the race against
+        # the child's startup-time SetConsoleMode calls, then settle to a slower
+        # steady-state rate.
+        for _ in range(500):
+            try:
+                if kernel32.GetConsoleMode(out_handle, ctypes.byref(mode)):
+                    if (mode.value & REQUIRED_BITS) != REQUIRED_BITS:
+                        kernel32.SetConsoleMode(out_handle, mode.value | REQUIRED_BITS)
+            except Exception:
+                pass
+            _time.sleep(0.001)
+        while True:
+            try:
+                if kernel32.GetConsoleMode(out_handle, ctypes.byref(mode)):
+                    if (mode.value & REQUIRED_BITS) != REQUIRED_BITS:
+                        kernel32.SetConsoleMode(out_handle, mode.value | REQUIRED_BITS)
+            except Exception:
+                pass
+            _time.sleep(0.01)
+
+    t = _threading.Thread(target=_loop, daemon=True, name="vt-keepalive")
+    t.start()
+
+
 def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input"):
     """Run agent as a direct subprocess, inject via Win32 console."""
+    # Newer codex/claude/etc TUIs require VT processing on the parent console;
+    # without this, ANSI escape sequences leak as text into the terminal.
+    # One-shot at startup (with diagnostic print) then a keepalive thread.
+    enable_vt_mode()
+    _vt_keepalive_thread()
+
     if inject_env:
         env = {**env, **inject_env}
     start_watcher(lambda text: inject(text, delay=inject_delay, enter_backend=enter_backend))
